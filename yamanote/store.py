@@ -113,6 +113,18 @@ CREATE TABLE IF NOT EXISTS steps (
 );
 CREATE INDEX IF NOT EXISTS steps_run ON steps(run_id, id);
 
+-- Write-ahead log of each agent conversation (see agent.Journal). A resumed
+-- run starts a new runs row that shares its predecessor's journal_id.
+CREATE TABLE IF NOT EXISTS journal (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    journal_id INTEGER NOT NULL,
+    run_id INTEGER NOT NULL,
+    ts REAL NOT NULL,
+    kind TEXT NOT NULL,
+    data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS journal_by_id ON journal(journal_id, id);
+
 CREATE TABLE IF NOT EXISTS retros (
     item_id INTEGER PRIMARY KEY,
     ts REAL NOT NULL,
@@ -171,7 +183,7 @@ class Store:
     MIGRATIONS = {
         "items": [("parent_id", "INTEGER"), ("holds", "INTEGER NOT NULL DEFAULT 0"), ("first_class", "TEXT"),
                   ("pending_status", "TEXT"), ("trial_model", "TEXT")],
-        "runs": [("cached_tokens", "INTEGER NOT NULL DEFAULT 0")],
+        "runs": [("cached_tokens", "INTEGER NOT NULL DEFAULT 0"), ("journal_id", "INTEGER")],
     }
 
     def _migrate(self) -> None:
@@ -301,9 +313,10 @@ class Store:
     # ─── runs & steps ───────────────────────────────────────────────────
 
     def start_run(self, item_id: int | None, role: str, station: str | None, model: str,
-                  service_class: str | None = None) -> int:
-        cur = self._exec("INSERT INTO runs (item_id, role, station, model, service_class, started_at)"
-                         " VALUES (?,?,?,?,?,?)", (item_id, role, station, model, service_class, time.time()))
+                  service_class: str | None = None, journal_id: int | None = None) -> int:
+        cur = self._exec("INSERT INTO runs (item_id, role, station, model, service_class, started_at, journal_id)"
+                         " VALUES (?,?,?,?,?,?,?)",
+                         (item_id, role, station, model, service_class, time.time(), journal_id))
         run = self.get_run(cur.lastrowid)
         self._notify("run", run)
         return cur.lastrowid
@@ -327,6 +340,9 @@ class Store:
                               "ts": ts, "kind": kind, "name": name, "detail": detail,
                               "cost_usd": cost_usd})
 
+    def set_run_journal(self, run_id: int, journal_id: int) -> None:
+        self._exec("UPDATE runs SET journal_id=? WHERE id=?", (journal_id, run_id))
+
     def finish_run(self, run_id: int, status: str, summary: str = "", error: str = "") -> None:
         self._exec("UPDATE runs SET status=?, ended_at=?, summary=?, error=? WHERE id=?",
                    (status, time.time(), summary[:4000], error[:2000], run_id))
@@ -346,6 +362,31 @@ class Store:
     def steps(self, run_id: int, after_id: int = 0, limit: int = 500) -> list[dict]:
         return self._all("SELECT * FROM steps WHERE run_id=? AND id>? ORDER BY id LIMIT ?",
                          (run_id, after_id, limit))
+
+    # ─── journal ────────────────────────────────────────────────────────
+
+    def journal_append(self, journal_id: int, run_id: int, kind: str, data: dict) -> None:
+        """Autocommitted before the agent acts on it; WAL keeps it across a process crash."""
+        self._exec("INSERT INTO journal (journal_id, run_id, ts, kind, data) VALUES (?,?,?,?,?)",
+                   (journal_id, run_id, time.time(), kind, json.dumps(data)))
+
+    def journal(self, journal_id: int) -> list[dict]:
+        rows = self._all("SELECT kind, data FROM journal WHERE journal_id=? ORDER BY id", (journal_id,))
+        return [{"kind": r["kind"], "data": json.loads(r["data"])} for r in rows]
+
+    def resumable_run(self, item_id: int, station: str, role: str, max_resumes: int) -> dict | None:
+        """The item's latest `role` run at `station`, if a dead process left it
+        interrupted with an open journal that hasn't been resumed too often."""
+        run = self._one("SELECT * FROM runs WHERE item_id=? AND station=? AND role=? ORDER BY id DESC LIMIT 1",
+                        (item_id, station, role))
+        if not run or run["status"] != "interrupted" or not run.get("journal_id"):
+            return None
+        counts = {r["kind"]: r["n"] for r in self._all(
+            "SELECT kind, COUNT(*) AS n FROM journal WHERE journal_id=? AND kind IN ('start','resume','end')"
+            " GROUP BY kind", (run["journal_id"],))}
+        if not counts.get("start") or counts.get("end") or counts.get("resume", 0) >= max_resumes:
+            return None
+        return run
 
     def interrupt_running(self) -> int:
         """On startup: runs left 'running' by a previous process are dead."""
@@ -391,6 +432,9 @@ class Store:
             steps = self._db.execute(
                 f"DELETE FROM steps WHERE run_id IN (SELECT id FROM runs WHERE item_id IN ({old})"
                 " OR (item_id IS NULL AND started_at < ?))", (*TERMINAL_STATUSES, cutoff, cutoff)).rowcount
+            self._db.execute(
+                f"DELETE FROM journal WHERE run_id IN (SELECT id FROM runs WHERE item_id IN ({old})"
+                " OR (item_id IS NULL AND started_at < ?))", (*TERMINAL_STATUSES, cutoff, cutoff))
             events = self._db.execute(
                 f"DELETE FROM events WHERE (item_id IN ({old})"
                 " AND kind NOT IN ('created','done','failed','rejected','cancelled'))"

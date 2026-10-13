@@ -10,13 +10,13 @@ OpenRouter agents at each station and Jev (via the
 | Module | Role |
 |---|---|
 | `factory.py` | Tick loop; one `_station_<name>` method per station; retrospectives and playbooks; Signal, Dispatcher, Ops |
-| `agent.py` | Tool-calling loop over OpenRouter; sandboxed file tools; `run` tool (temp-file output, process-group cleanup) |
+| `agent.py` | Tool-calling loop over OpenRouter; sandboxed file tools; `run` tool (temp-file output, process-group cleanup); durable runs (Journal, `resume`, `REPLAY_SAFE_TOOLS`) |
 | `llm.py` | OpenRouter client: exact cost from `usage.cost`, fallbacks, Anthropic cache breakpoints |
 | `stats.py` | Stats view numbers, computed from the store per request |
 | `telemetry.py` | OpenTelemetry export: train traces (GenAI conventions) + metrics over OTLP/HTTP JSON |
 | `fleet.py` | Model fleet: daily OpenRouter catalogue, price bands per class, challenger trials, promotion and replacement |
 | `cron.py` | Five-field cron parser (`prev`/`next`) for the autopilot schedule |
-| `store.py` | SQLite: items, events, runs, steps, retros, kv. `Store.transition()` is compare-and-set — use it for status changes from jobs |
+| `store.py` | SQLite: items, events, runs, steps, journal, retros, kv. `Store.transition()` is compare-and-set — use it for status changes from jobs |
 | `prompts.py` | Station system prompts + JSON result schemas |
 | `decisions.py` | Jev questions (difficulty, triage screen, file relevance, log screen); imports `decide` (installed, or `YAMANOTE_DECIDE_SRC`); every call returns None when decide is unavailable |
 | `checks.py`, `gitops.py`, `notify.py`, `dashboard.py`, `settings.py`, `web/` | Deterministic checks, git, hooks, API/SSE, config, UI |

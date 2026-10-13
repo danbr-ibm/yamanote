@@ -217,6 +217,9 @@ MIN_READY_ITEMS = 1  # dispatcher tops the line up when fewer items than this ar
 
 AGENT_TIMEOUT_SECONDS = _env_int("AGENT_TEAM_AGENT_TIMEOUT_SECONDS", 1200)
 AGENT_MAX_STEPS = _env_int("AGENT_TEAM_AGENT_MAX_STEPS", 60)
+# Times a run interrupted by a restart is resumed from its journal before the
+# train starts that station's agent afresh (0 turns resuming off).
+AGENT_MAX_RESUMES = _env_int("AGENT_TEAM_AGENT_MAX_RESUMES", 2)
 TOOL_TIMEOUT_SECONDS = 180
 DISPATCHER_INTERVAL = _env_int("AGENT_TEAM_DISPATCHER_INTERVAL", 1800)
 OPS_INTERVAL = _env_int("AGENT_TEAM_OPS_INTERVAL", 3600)

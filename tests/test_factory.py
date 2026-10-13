@@ -410,6 +410,54 @@ class RecoveryTest(FactoryTestCase):
         self.assertEqual(self.item(item["id"])["status"], "queued")
         self.assertEqual(self.store.get_run(run)["status"], "interrupted")
 
+    def test_restart_resumes_the_interrupted_builder_from_its_journal(self):
+        import threading
+        started = threading.Event()
+
+        def build(messages, turn):
+            if turn == 0:
+                started.set()
+                return reply(tool_call("run", {"command": "echo once >> ran.log; sleep 30"}))
+            if turn == 1:
+                self.assertIn("INTERRUPTED", messages[-2]["content"], "the cut-off call is reported back")
+                self.assertIn("restarted", messages[-1]["content"])
+                return reply(tool_call("write_file", {"path": "hello.py", "content": "print('hello')\n"}))
+            return finish("wrote hello.py", {"verified_with": "python3 hello.py"})
+
+        f = self.make(builder=build)
+        item = f.create_item("Add hello", "Create hello.py that prints hello")
+        self.assertTrue(run_until(f, started.is_set))
+        run_until(f, lambda: os.path.exists(os.path.join(self.item(item["id"])["worktree"], "ran.log")))
+        f.shutdown()
+        f.pool.shutdown(wait=True)
+        self.assertEqual(self.item(item["id"])["status"], "running")
+        first = [r for r in self.store.runs(item["id"]) if r["role"] == "builder"][-1]
+        self.assertEqual(first["status"], "interrupted")
+
+        f = self.make(builder=build)
+        self.assertTrue(run_until(f, lambda: self.item(item["id"])["status"] == "done"))
+        builders = [r for r in self.store.runs(item["id"]) if r["role"] == "builder"]
+        self.assertEqual(len(builders), 2, "resumed, not started afresh")
+        self.assertEqual(builders[1]["journal_id"], first["id"])
+        self.assertIn("resumed", self.kinds(item["id"]))
+        self.assertEqual((self.env.project / "ran.log").read_text(), "once\n", "the command was not re-run")
+
+    def test_resumable_run_needs_an_open_journal_and_resumes_left(self):
+        item = self.store.create_item(title="x", project=str(self.env.project))
+        run = self.store.start_run(item["id"], "builder", "build", "m", journal_id=None)
+        self.store.set_run_journal(run, run)
+        self.store.journal_append(run, run, "start", {"messages": []})
+        self.assertIsNone(self.store.resumable_run(item["id"], "build", "builder", 2), "still running")
+        self.store.interrupt_running()
+        self.assertEqual(self.store.resumable_run(item["id"], "build", "builder", 2)["id"], run)
+        self.assertIsNone(self.store.resumable_run(item["id"], "inspect", "builder", 2))
+        self.assertIsNone(self.store.resumable_run(item["id"], "build", "builder", 0), "resuming turned off")
+        for _ in range(2):
+            self.store.journal_append(run, run, "resume", {})
+        self.assertIsNone(self.store.resumable_run(item["id"], "build", "builder", 2), "resumed too often")
+        self.store.journal_append(run, run, "end", {"status": "ok"})
+        self.assertIsNone(self.store.resumable_run(item["id"], "build", "builder", 9), "journal closed")
+
 
 if __name__ == "__main__":
     unittest.main()

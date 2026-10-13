@@ -48,6 +48,14 @@ class StoreRecorder:
         self.store.add_step(self.run_id, kind, name, detail, tokens_in, tokens_out, cost_usd, model, cached_tokens)
 
 
+class StoreJournal:
+    def __init__(self, store: Store, journal_id: int, run_id: int):
+        self.store, self.journal_id, self.run_id = store, journal_id, run_id
+
+    def append(self, kind, data):
+        self.store.journal_append(self.journal_id, self.run_id, kind, data)
+
+
 class ItemGone(Exception):
     """The item was cancelled or otherwise finished while a job was running."""
 
@@ -470,19 +478,30 @@ class Factory:
         self._check_budget(item)
         model, cls = self.model_for(station, item)
         item_id = item["id"] if item else None
-        run_id = self.store.start_run(item_id, role, station, model, cls)
+        prior = item and self.store.resumable_run(item_id, station, role, settings.AGENT_MAX_RESUMES)
+        run_id = self.store.start_run(item_id, role, station, model, cls,
+                                      journal_id=prior["journal_id"] if prior else None)
+        journal_id = prior["journal_id"] if prior else run_id
+        if not prior:
+            self.store.set_run_journal(run_id, journal_id)
         budget = settings.RUN_BUDGET_USD
         if item:
             spent = (self.store.get_item(item_id) or item).get("cost_usd") or 0
             budget = min(budget, settings.ITEM_BUDGET_USD - spent)
         agent = Agent(role=role, model=model, system=system.format(root=root, branch=(item or {}).get("branch", "")),
                       root=root, tools=tools, result_schema=schema, recorder=StoreRecorder(self.store, run_id),
-                      client=self.client, fallbacks=[settings.FALLBACK_MODEL], budget_usd=budget)
+                      client=self.client, fallbacks=[settings.FALLBACK_MODEL], budget_usd=budget,
+                      journal=StoreJournal(self.store, journal_id, run_id))
         agent_key = key or (f"item:{item_id}" if item_id else role)
         self.agents[agent_key] = agent
         METRICS.agent_launches_total.inc({"agent": role})
         try:
-            res = agent.run(task)
+            if prior:
+                self.store.event(item_id, station, "resumed", f"{role.capitalize()} picks up interrupted run "
+                                 f"#{prior['id']} from its journal", {"run_id": run_id, "from_run": prior["id"]})
+                res = agent.resume(self.store.journal(journal_id), _resume_note(station))
+            else:
+                res = agent.run(task)
         except Exception as e:
             res = AgentResult(status="error", error=f"{type(e).__name__}: {e}")
         finally:
@@ -1799,6 +1818,15 @@ def _ops_settings() -> str:
 def _signature(line: str) -> str:
     """Error identity with numbers (ids, timestamps, ports) masked."""
     return re.sub(r"\d+", "N", line)[:120]
+
+
+def _resume_note(station: str) -> str:
+    """What an agent resumed after a restart should know beyond its own calls."""
+    note = ("The factory process restarted while you were working; your run was resumed from its journal. "
+            "Background processes you started with `run` may have stopped.")
+    if station != "build":
+        note += " Uncommitted changes in the worktree were discarded on restart, so files you wrote may be gone."
+    return note + " Check the state you depend on before continuing."
 
 
 def validate_project(path: str) -> str | None:

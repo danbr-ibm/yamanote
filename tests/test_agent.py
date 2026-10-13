@@ -1,8 +1,10 @@
 """Agent loop and tool sandbox tests (offline)."""
 from __future__ import annotations
 
+import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -167,6 +169,119 @@ class LoopTest(unittest.TestCase):
     def test_missing_result_is_an_error(self):
         res, _ = self.run_agent(finish("no result"), schema={"type": "object"})
         self.assertEqual(res.status, "error")
+
+
+class ListJournal:
+    def __init__(self, entries=None):
+        self.entries = list(entries or [])
+
+    def append(self, kind, data):
+        self.entries.append({"kind": kind, "data": json.loads(json.dumps(data))})
+
+    def kinds(self):
+        return [e["kind"] for e in self.entries]
+
+
+class DurableLoopTest(unittest.TestCase):
+    """A journaled run, cut off at some point, continues in a fresh Agent."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.seen = []  # messages the model was shown, per call
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def agent(self, *turns, journal=None, **kw):
+        seq = list(turns)
+
+        def builder(messages, turn):
+            self.seen.append(list(messages))
+            return seq[turn] if turn < len(seq) else finish("done")
+        return Agent(role="build", model="m", system=SYSTEM, root=str(self.root),
+                     tools=READ_TOOLS + WRITE_TOOLS + RUN_TOOLS, recorder=Recorder(),
+                     client=FakeClient({"builder": builder}), journal=journal or ListJournal(), **kw)
+
+    def interrupted_after_call(self, call):
+        """The journal of a run whose process died while `call` was executing."""
+        j = ListJournal()
+        j.append("start", {"messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": "task"}]})
+        msg = reply(call).message
+        j.append("model", {"message": msg, "usage": {"tokens_in": 100, "cost_usd": 0.25}, "elapsed": 5.0})
+        j.append("call", {"key": call["id"], "name": call["function"]["name"],
+                          "args": json.loads(call["function"]["arguments"])})
+        return j
+
+    def test_every_turn_is_journaled_and_each_call_before_it_runs(self):
+        j = ListJournal()
+        a = self.agent(reply(tool_call("write_file", {"path": "f.txt", "content": "hi"})), finish("ok"), journal=j)
+        dispatch = a._dispatch
+        a._dispatch = lambda name, args: (self.assertEqual(j.kinds()[-1], "call"), dispatch(name, args))[1]
+        self.assertTrue(a.run("task").ok)
+        self.assertEqual(j.kinds(), ["start", "model", "call", "result", "model", "result", "end"])
+        self.assertEqual(j.entries[2]["data"], {"key": "call_write_file_0", "name": "write_file",
+                                               "args": {"path": "f.txt", "content": "hi"}})
+
+    def test_unsafe_interrupted_call_is_reported_not_rerun(self):
+        call = tool_call("run", {"command": "echo x >> ran.txt"})
+        j = self.interrupted_after_call(call)
+        res = self.agent(None, finish("checked"), journal=j).resume(j.entries)
+        self.assertTrue(res.ok)
+        self.assertFalse((self.root / "ran.txt").exists(), "run is not replay-safe")
+        report = self.seen[-1][-1]
+        self.assertEqual((report["role"], report["tool_call_id"]), ("tool", call["id"]))
+        self.assertIn("INTERRUPTED", report["content"])
+        self.assertIn("Investigate", report["content"])
+        self.assertEqual(j.entries[3]["data"], {"interrupted": [call["id"]], "replayed": []})
+
+    def test_safe_interrupted_call_is_replayed(self):
+        (self.root / "a.txt").write_text("hello\n")
+        j = self.interrupted_after_call(tool_call("read_file", {"path": "a.txt"}))
+        a = self.agent(None, finish("read it"), journal=j)
+        self.assertTrue(a.resume(j.entries).ok)
+        self.assertIn("hello", self.seen[-1][-1]["content"])
+        self.assertEqual(a.resumed, {"interrupted": 0, "replayed": 1})
+
+    def test_calls_that_never_started_run_normally(self):
+        first, second = (tool_call("write_file", {"path": "a.txt", "content": "1"}, 0),
+                         tool_call("run", {"command": "echo ran > b.txt"}, 1))
+        j = ListJournal()
+        j.append("start", {"messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": "task"}]})
+        j.append("model", {"message": reply(first, second).message, "usage": {}, "elapsed": 1.0})
+        j.append("call", {"key": first["id"], "name": "write_file", "args": {"path": "a.txt", "content": "1"}})
+        j.append("result", {"key": first["id"], "content": "Wrote a.txt"})
+        self.assertTrue(self.agent(None, finish("ok"), journal=j).resume(j.entries).ok)
+        self.assertFalse((self.root / "a.txt").exists(), "a call with a result is not run again")
+        self.assertEqual((self.root / "b.txt").read_text(), "ran\n")
+        self.assertEqual([m.get("tool_call_id") for m in self.seen[-1][-2:]], [first["id"], second["id"]])
+
+    def test_a_journaled_finish_completes_without_another_model_call(self):
+        j = ListJournal()
+        self.agent(finish("all done", {"verdict": "APPROVED"}), journal=j, result_schema={"type": "object"}).run("t")
+        open_run = [e for e in j.entries if e["kind"] != "end"]  # died before the factory saw the result
+        self.seen.clear()
+        res = self.agent(journal=ListJournal(open_run), result_schema={"type": "object"}).resume(open_run)
+        self.assertEqual((res.status, res.result), ("ok", {"verdict": "APPROVED"}))
+        self.assertEqual(self.seen, [])
+
+    def test_resumed_run_keeps_counting_against_its_limits(self):
+        j = self.interrupted_after_call(tool_call("list_dir", {}))
+        res = self.agent(None, reply(tool_call("list_dir", {})), journal=j, max_steps=2).resume(j.entries)
+        self.assertEqual(res.status, "max_steps")
+        self.assertAlmostEqual(res.cost_usd, 0.251)
+
+    def test_resume_note_is_shown_to_the_agent(self):
+        j = self.interrupted_after_call(tool_call("list_dir", {}))
+        self.agent(None, finish("ok"), journal=j).resume(j.entries, note="worktree was reset")
+        self.assertEqual(self.seen[-1][-1], {"role": "user", "content": "worktree was reset"})
+
+    def test_cancelled_run_leaves_the_journal_open_and_the_call_unanswered(self):
+        j = ListJournal()
+        a = self.agent(reply(tool_call("run", {"command": "sleep 30"})), journal=j)
+        threading.Timer(0.5, a.stop).start()
+        self.assertEqual(a.run("task").status, "cancelled")
+        self.assertEqual(j.kinds(), ["start", "model", "call"])
 
 
 class HelperTest(unittest.TestCase):

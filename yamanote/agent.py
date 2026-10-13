@@ -5,6 +5,12 @@ a set of tools. It loops: model → tool calls → results → model, until the
 model calls `finish` (or a step/time/budget limit trips). Every model turn and
 tool call is reported to a Recorder so the dashboard can show the run live.
 
+With a Journal the loop is durable: the conversation, each model reply and each
+tool call's intent are appended before anything acts on them, so a new process
+can `resume` the run from the journal. A tool call that was in flight when the
+process died is re-run only if its tool is in REPLAY_SAFE_TOOLS; otherwise the
+agent gets an interruption report as the call's result and investigates.
+
 File tools are confined to `root` (paths are resolved and must stay inside).
 `run` executes shell commands with `root` as cwd and secrets stripped from the
 environment; like the Claude Code CLI it replaces, it is not a hard sandbox.
@@ -30,6 +36,10 @@ from .llm import Client, LLMError
 READ_TOOLS = ("list_dir", "read_file", "grep")
 WRITE_TOOLS = ("write_file", "edit_file")
 RUN_TOOLS = ("run",)
+# Tools whose interrupted call can simply run again: reads, and a whole-file
+# write (same content, same result). edit_file is not (the edit may already be
+# applied, so old_string is gone or matches twice) and neither is run.
+REPLAY_SAFE_TOOLS = frozenset(READ_TOOLS + ("write_file",))
 
 MAX_TOOL_OUTPUT = 12_000
 MAX_READ_CHARS = 60_000
@@ -45,6 +55,21 @@ class Recorder(Protocol):
 
 class NullRecorder:
     def step(self, *args, **kwargs) -> None:
+        pass
+
+
+class Journal(Protocol):
+    """Append-only, durable record of a run. Entries are written before the
+    loop acts on them; `resume` rebuilds the run from them in order.
+
+    kinds: start {messages} · model {message, usage, elapsed} · message {message}
+    · call {key, name, args} (before the tool runs) · result {key, content}
+    · resume {interrupted, replayed} · end {status}"""
+    def append(self, kind: str, data: dict) -> None: ...
+
+
+class NullJournal:
+    def append(self, kind: str, data: dict) -> None:
         pass
 
 
@@ -128,34 +153,81 @@ class Agent:
     budget_usd: float = settings.RUN_BUDGET_USD
     cancel: threading.Event = field(default_factory=threading.Event)
     max_tokens: int = 8000
+    journal: Journal = field(default_factory=NullJournal)
 
     def __post_init__(self):
         self.client = self.client or Client()
         self.root = os.path.realpath(self.root)
         self._pgids: set[int] = set()  # every process group started by `run`, killed when the run ends
+        self.resumed: dict | None = None  # set by resume(): interrupted/replayed call counts
 
     # -- loop --
 
     def run(self, task: str) -> AgentResult:
+        messages = [{"role": "system", "content": self.system}, {"role": "user", "content": task}]
+        self.journal.append("start", {"messages": messages})
+        return self._guarded(messages, AgentResult(status="ok", model=self.model), 0.0, [], set())
+
+    def resume(self, entries: list[dict], note: str = "") -> AgentResult:
+        """Continue a run from its journal entries ({kind, data}, oldest first).
+
+        Calls of the last model reply that never started run normally; one that
+        started but has no result is replayed if REPLAY_SAFE_TOOLS allows it,
+        and otherwise answered with an interruption report. `note` tells the
+        agent what else changed while it was down."""
+        messages, res, elapsed, tail, started = _replay(entries, self.model)
+        if not messages:
+            res.status, res.error = "error", "journal has no start entry"
+            return res
+        interrupted = [k for k in started if not _replay_safe(tail, k)]
+        replayed = [k for k in started if k not in interrupted]
+        self.journal.append("resume", {"interrupted": interrupted, "replayed": replayed})
+        self.resumed = {"interrupted": len(interrupted), "replayed": len(replayed)}
+        self.recorder.step("resume", self.role, f"Resumed from the journal after {res.steps} model turns: "
+                           f"{len(interrupted)} interrupted call(s) reported, {len(replayed)} replayed")
+        return self._guarded(messages, res, elapsed, tail, started, note)
+
+    def _guarded(self, *args) -> AgentResult:
         try:
-            return self._loop(task)
+            res = self._loop(*args)
         finally:
             self._kill_process_groups()
+        # A cancelled run (shutdown or cancel) is left open so it can be resumed.
+        if res.status != "cancelled":
+            self.journal.append("end", {"status": res.status})
+        return res
 
-    def _loop(self, task: str) -> AgentResult:
+    def _say(self, messages: list[dict], content: str) -> None:
+        msg = {"role": "user", "content": content}
+        self.journal.append("message", {"message": msg})
+        messages.append(msg)
+
+    def _loop(self, messages: list[dict], res: AgentResult, elapsed: float,
+              calls: list[dict], started: set[str], note: str = "") -> AgentResult:
         schemas = [TOOL_SCHEMAS[t] for t in self.tools] + [finish_schema(self.result_schema)]
-        messages: list[dict] = [{"role": "system", "content": self.system},
-                                {"role": "user", "content": task}]
-        res = AgentResult(status="ok", model=self.model)
-        started = time.monotonic()
+        start = time.monotonic() - elapsed
         nudged = False
         empty_replies = 0
 
         while True:
+            if calls:
+                finished = self._call_tools(calls, messages, started)
+                started = set()
+                if self.cancel.is_set():
+                    res.status = "cancelled"
+                    return res
+                if finished is not None:
+                    return self._finish(res, finished)
+                _trim_history(messages)
+                calls = []
+            if note:
+                self._say(messages, note)
+                note = ""
+
             if self.cancel.is_set():
                 res.status = "cancelled"
                 return res
-            if time.monotonic() - started > self.timeout:
+            if time.monotonic() - start > self.timeout:
                 res.status, res.error = "timeout", f"exceeded {self.timeout:.0f}s"
                 return res
             if res.steps >= self.max_steps:
@@ -173,16 +245,16 @@ class Agent:
                 self.recorder.step("error", "llm", str(e)[:500], model=self.model)
                 return res
 
-            res.steps += 1
-            res.cached_tokens += completion.cached_tokens
-            res.tokens_in += completion.tokens_in
-            res.tokens_out += completion.tokens_out
-            res.cost_usd += completion.cost_usd
-            res.model = completion.model
             msg = dict(completion.message)
             msg["role"] = "assistant"
             msg.pop("refusal", None)
             msg.pop("reasoning_details", None)
+            usage = {"tokens_in": completion.tokens_in, "tokens_out": completion.tokens_out,
+                     "cost_usd": completion.cost_usd, "cached_tokens": completion.cached_tokens,
+                     "model": completion.model}
+            self.journal.append("model", {"message": msg, "usage": usage,
+                                          "elapsed": time.monotonic() - start})
+            _count(res, usage)
             messages.append(msg)
             thought = completion.text.strip()
             empty = not thought and not completion.tool_calls
@@ -192,21 +264,19 @@ class Agent:
                                cost_usd=completion.cost_usd, model=completion.model,
                                cached_tokens=completion.cached_tokens)
 
-            calls = completion.tool_calls
             if empty and empty_replies < 2:
                 # Some models occasionally return nothing at all; re-ask directly
                 # rather than ending the run (which costs a retry with backoff).
                 empty_replies += 1
-                messages.append({"role": "user", "content": "Your last reply was empty. Continue: use a tool, or call "
-                                 "`finish` now with your result."})
+                self._say(messages, "Your last reply was empty. Continue: use a tool, or call `finish` now with your result.")
                 continue
-            if not calls:
+            if not completion.tool_calls:
                 if completion.finish_reason == "length":
-                    messages.append({"role": "user", "content": "Your reply was cut off. Continue, using tools; keep each reply short."})
+                    self._say(messages, "Your reply was cut off. Continue, using tools; keep each reply short.")
                     continue
                 if not nudged:
                     nudged = True
-                    messages.append({"role": "user", "content": "Continue the task using the tools. When you are done, call the `finish` tool."})
+                    self._say(messages, "Continue the task using the tools. When you are done, call the `finish` tool.")
                     continue
                 # The model insists on plain text: accept it as the outcome.
                 res.summary = thought
@@ -214,38 +284,57 @@ class Agent:
                 if self.result_schema and res.result is None:
                     res.status, res.error = "error", "agent ended without calling finish"
                 return res
+            calls = completion.tool_calls
 
-            finished = None
-            for call in calls:
-                fn = call.get("function") or {}
-                name = fn.get("name", "")
-                try:
-                    args = json.loads(fn.get("arguments") or "{}")
-                    if not isinstance(args, dict):
-                        raise ValueError("arguments must be an object")
-                except (json.JSONDecodeError, ValueError) as e:
-                    output = f"ERROR: could not parse arguments as JSON ({e}). Retry with valid JSON."
-                    args = None
-                if args is not None and name == "finish":
-                    finished = args
-                    output = "ok"
-                elif args is not None:
-                    output = self._dispatch(name, args)
-                    self.recorder.step("tool", name, _describe_call(name, args, output))
-                messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": output})
+    def _call_tools(self, calls: list[dict], messages: list[dict], started: set[str]) -> dict | None:
+        """Run a model reply's tool calls in order and return finish's arguments
+        if it was called. Calls that already have a result in `messages` (a
+        resumed run) are skipped; those in `started` were cut off mid-call."""
+        last = max(i for i, m in enumerate(messages) if m.get("role") == "assistant")
+        answered = {m.get("tool_call_id") for m in messages[last + 1:] if m.get("role") == "tool"}
+        finished = None
+        for i, call in enumerate(calls):
+            key = _call_key(call, i)
+            fn = call.get("function") or {}
+            name = fn.get("name", "")
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+                if not isinstance(args, dict):
+                    raise ValueError("arguments must be an object")
+            except (json.JSONDecodeError, ValueError) as e:
+                output = f"ERROR: could not parse arguments as JSON ({e}). Retry with valid JSON."
+                args = None
+            if args is not None and name == "finish":
+                finished = args
+            if key in answered:
+                continue
+            if args is not None and name == "finish":
+                output = "ok"
+            elif args is not None and key in started and name not in REPLAY_SAFE_TOOLS:
+                output = _interruption_report(name)
+                self.recorder.step("interrupted", name, _describe_call(name, args, output))
+            elif args is not None:
+                if key not in started:
+                    self.journal.append("call", {"key": key, "name": name, "args": args})
+                output = self._dispatch(name, args)
+                if self.cancel.is_set():
+                    return None  # the result may be cut short: leave the call open for resume
+                self.recorder.step("tool", name, _describe_call(name, args, output)
+                                   + ("\n(replayed after restart)" if key in started else ""))
+            self.journal.append("result", {"key": key, "content": output})
+            messages.append({"role": "tool", "tool_call_id": key, "content": output})
+        return finished
 
-            if finished is not None:
-                res.summary = str(finished.get("summary", "")).strip()
-                result = finished.get("result")
-                if isinstance(result, str):
-                    result = _extract_json(result) or {"value": result}
-                res.result = result if isinstance(result, dict) else None
-                if self.result_schema and res.result is None:
-                    res.status, res.error = "error", "finish called without a result object"
-                self.recorder.step("finish", self.role, res.summary[:2000])
-                return res
-
-            _trim_history(messages)
+    def _finish(self, res: AgentResult, finished: dict) -> AgentResult:
+        res.summary = str(finished.get("summary", "")).strip()
+        result = finished.get("result")
+        if isinstance(result, str):
+            result = _extract_json(result) or {"value": result}
+        res.result = result if isinstance(result, dict) else None
+        if self.result_schema and res.result is None:
+            res.status, res.error = "error", "finish called without a result object"
+        self.recorder.step("finish", self.role, res.summary[:2000])
+        return res
 
     def stop(self):
         """Cancel the run and kill any running shell command (and anything it backgrounded)."""
@@ -463,6 +552,67 @@ def _describe_call(name: str, args: dict, output: str) -> str:
         head = json.dumps(args)[:200]
     first = output.strip().splitlines()[0] if output.strip() else ""
     return f"{head}\n→ {first[:300]}"
+
+
+def _call_key(call: dict, index: int) -> str:
+    """A tool call's id, or its position when the provider sent none."""
+    return call.get("id") or f"call_{index}"
+
+
+def _count(res: AgentResult, usage: dict) -> None:
+    res.steps += 1
+    res.tokens_in += usage.get("tokens_in", 0)
+    res.tokens_out += usage.get("tokens_out", 0)
+    res.cost_usd += usage.get("cost_usd", 0.0)
+    res.cached_tokens += usage.get("cached_tokens", 0)
+    res.model = usage.get("model") or res.model
+
+
+def _replay(entries: list[dict], model: str) -> tuple[list[dict], AgentResult, float, list[dict], set[str]]:
+    """Rebuild a run from its journal: the messages so far, the counters
+    (steps and spend count against the resumed run's limits), the elapsed
+    time, the last reply's tool calls, and the calls that started without
+    finishing."""
+    messages: list[dict] = []
+    res = AgentResult(status="ok", model=model)
+    elapsed = 0.0
+    tail: list[dict] = []
+    started: set[str] = set()
+    for entry in entries:
+        kind, data = entry["kind"], entry["data"]
+        if kind == "start":
+            messages = list(data["messages"])
+        elif kind == "model":
+            messages.append(data["message"])
+            _count(res, data.get("usage") or {})
+            elapsed = data.get("elapsed", elapsed)
+            tail, started = data["message"].get("tool_calls") or [], set()
+        elif kind == "message":
+            messages.append(data["message"])
+            tail, started = [], set()
+        elif kind == "call":
+            started.add(data["key"])
+        elif kind == "result":
+            started.discard(data["key"])
+            messages.append({"role": "tool", "tool_call_id": data["key"], "content": data["content"]})
+    return messages, res, elapsed, tail, started
+
+
+def _replay_safe(calls: list[dict], key: str) -> bool:
+    for i, call in enumerate(calls):
+        if _call_key(call, i) == key:
+            return (call.get("function") or {}).get("name") in REPLAY_SAFE_TOOLS
+    return False
+
+
+def _interruption_report(name: str) -> str:
+    report = (f"INTERRUPTED: the process running you stopped while this `{name}` call was in progress, so it "
+              "may have completed, partly completed, or not run at all. It was not re-run because it is not "
+              "safe to replay. Investigate before continuing: check the state this call would have changed "
+              "(git status, git diff, the files involved), then redo it only if it is still needed.")
+    if name == "run":
+        report += " Anything the command started in the background may or may not still be running."
+    return report
 
 
 def _trim_history(messages: list[dict]) -> None:

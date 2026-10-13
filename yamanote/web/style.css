@@ -369,7 +369,8 @@ code.cmd { font-family: var(--mono); font-size: 11px; background: var(--surface-
 .steps .s-tool .sk { color: var(--c-shinkansen); }
 .steps .s-model .sk { color: var(--line-deep); }
 .steps .s-finish .sk { color: var(--ok); }
-.steps .s-error .sk { color: var(--bad); }
+.steps .s-error .sk, .steps .s-interrupted .sk { color: var(--bad); }
+.steps .s-resume .sk { color: var(--c-rapid); }
 .steps .s-decision .sk { color: var(--c-rapid); }
 .run-head .role.ci { color: var(--c-shinkansen); }
 .steps .sd { font-family: var(--mono); white-space: pre-wrap; word-break: break-word; }
