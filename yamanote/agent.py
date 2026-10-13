@@ -45,6 +45,8 @@ MAX_TOOL_OUTPUT = 12_000
 MAX_READ_CHARS = 60_000
 CONTEXT_SOFT_LIMIT = 320_000  # characters of history before old tool output is trimmed
 KEEP_RECENT_TOOL_RESULTS = 8
+EVIDENCE_OUTPUT_CHARS = 1500  # tail of a cut-off command's output shown on resume
+SNAPSHOT_STATUS_LINES = 20    # git status lines shown on resume
 _SECRET_ENV = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.I)
 
 
@@ -63,7 +65,8 @@ class Journal(Protocol):
     loop acts on them; `resume` rebuilds the run from them in order.
 
     kinds: start {messages} · model {message, usage, elapsed} · message {message}
-    · call {key, name, args} (before the tool runs) · result {key, content}
+    · call {key, name, args} (before the tool runs) · spawn {key, pgid, output, boot}
+    (a `run` command's process and output file) · result {key, content}
     · resume {interrupted, replayed} · end {status}"""
     def append(self, kind: str, data: dict) -> None: ...
 
@@ -160,6 +163,8 @@ class Agent:
         self.root = os.path.realpath(self.root)
         self._pgids: set[int] = set()  # every process group started by `run`, killed when the run ends
         self.resumed: dict | None = None  # set by resume(): interrupted/replayed call counts
+        self._evidence: dict[str, str] = {}  # interrupted call key -> what resume found out about it
+        self._calling: str | None = None  # key of the tool call being dispatched
 
     # -- loop --
 
@@ -175,12 +180,17 @@ class Agent:
         started but has no result is replayed if REPLAY_SAFE_TOOLS allows it,
         and otherwise answered with an interruption report. `note` tells the
         agent what else changed while it was down."""
-        messages, res, elapsed, tail, started = _replay(entries, self.model)
+        messages, res, elapsed, tail, started, spawns, last_ts = _replay(entries, self.model)
         if not messages:
             res.status, res.error = "error", "journal has no start entry"
             return res
+        # A `run` journaled as called but with no process spawned never ran.
+        started = {k for k in started if _tool_of(tail, k)[0] != "run" or k in spawns}
         interrupted = [k for k in started if not _replay_safe(tail, k)]
         replayed = [k for k in started if k not in interrupted]
+        # Gather evidence before anything runs (this also stops a command still running).
+        self._evidence = {k: self._call_evidence(*_tool_of(tail, k), spawns.get(k)) for k in interrupted}
+        note = "\n\n".join(part for part in (note, self._workspace_snapshot(last_ts)) if part)
         self.journal.append("resume", {"interrupted": interrupted, "replayed": replayed})
         self.resumed = {"interrupted": len(interrupted), "replayed": len(replayed)}
         self.recorder.step("resume", self.role, f"Resumed from the journal after {res.steps} model turns: "
@@ -311,12 +321,16 @@ class Agent:
             if args is not None and name == "finish":
                 output = "ok"
             elif args is not None and key in started and name not in REPLAY_SAFE_TOOLS:
-                output = _interruption_report(name)
+                output = _interruption_report(name, self._evidence.get(key, ""))
                 self.recorder.step("interrupted", name, _describe_call(name, args, output))
             elif args is not None:
                 if key not in started:
                     self.journal.append("call", {"key": key, "name": name, "args": args})
-                output = self._dispatch(name, args)
+                self._calling = key
+                try:
+                    output = self._dispatch(name, args)
+                finally:
+                    self._calling = None
                 if self.cancel.is_set():
                     return None  # the result may be cut short: leave the call open for resume
                 self.recorder.step("tool", name, _describe_call(name, args, output)
@@ -469,11 +483,16 @@ class Agent:
         limit = min(int(timeout or 120), settings.TOOL_TIMEOUT_SECONDS)
         env = {k: v for k, v in os.environ.items() if not _SECRET_ENV.search(k) and k != "CLAUDECODE"}
         env["GIT_TERMINAL_PROMPT"] = "0"
-        with tempfile.TemporaryFile(mode="w+", errors="replace") as out_file:
+        # Named, so a resumed run can show what a cut-off command printed.
+        fd, out_path = tempfile.mkstemp(prefix="yamanote-run-", suffix=".log")
+        with os.fdopen(fd, "w+", errors="replace") as out_file:
             proc = subprocess.Popen(["bash", "-c", command], cwd=self.root, env=env, text=True,
                                     stdout=out_file, stderr=subprocess.STDOUT,
                                     stdin=subprocess.DEVNULL, start_new_session=True)
             self._pgids.add(proc.pid)  # new session: pgid == pid
+            if self._calling:
+                self.journal.append("spawn", {"key": self._calling, "pgid": proc.pid, "output": out_path,
+                                              "boot": _boot_id()})
             deadline = time.monotonic() + limit
             rc: int | str
             while True:
@@ -493,7 +512,57 @@ class Agent:
                         break
             out_file.seek(0)
             out = out_file.read(MAX_TOOL_OUTPUT * 4)
+        if not self.cancel.is_set():  # a cancelled call stays open in the journal; resume reads and removes the file
+            _unlink(out_path)
         return f"[exit {rc}]\n{_truncate(out)}"
+
+    # -- resume evidence --
+
+    def _call_evidence(self, name: str, args: dict, spawn: dict | None) -> str:
+        """Facts about an interrupted call, gathered without the model."""
+        try:
+            if name == "run" and spawn:
+                return _run_evidence(spawn)
+            if name == "edit_file":
+                return self._edit_evidence(args)
+        except (OSError, PathError, TypeError, ValueError) as e:
+            return f"(Could not inspect the call: {e})"
+        return ""
+
+    def _edit_evidence(self, args: dict) -> str:
+        p = self._path(args.get("path"))
+        if not p.is_file():
+            return f"{self._rel(p)} does not exist now."
+        text = p.read_text(errors="replace")
+        old, new = args.get("old_string") or "", args.get("new_string") or ""
+        n_old, n_new = text.count(old) if old else 0, text.count(new) if new else 0
+        facts = f"{self._rel(p)} now contains old_string {n_old} time(s) and new_string {n_new} time(s)"
+        if n_old == 0 and n_new > 0 and old not in new:
+            return facts + ": the edit looks applied."
+        if n_old > 0 and n_new == 0:
+            return facts + ": the edit looks not applied."
+        return facts + "."
+
+    def _workspace_snapshot(self, last_ts: float | None) -> str:
+        """How long the run was down and what the worktree looks like now, in a few lines."""
+        parts = []
+        if last_ts:
+            parts.append(f"You were stopped {_ago(time.time() - last_ts)} ago.")
+        status = _git(self.root, "status", "--short")
+        if status is None:
+            return " ".join(parts)
+        lines = status.splitlines()
+        shown = "\n".join(lines[:SNAPSHOT_STATUS_LINES]) or "(clean)"
+        if len(lines) > SNAPSHOT_STATUS_LINES:
+            shown += f"\n… {len(lines) - SNAPSHOT_STATUS_LINES} more"
+        parts.append(f"Worktree now (git status --short):\n{shown}")
+        stat = (_git(self.root, "diff", "HEAD", "--stat") or "").strip().splitlines()
+        if stat:
+            parts.append(f"Uncommitted vs HEAD: {stat[-1].strip()}")
+        head = (_git(self.root, "log", "-1", "--format=%h %s (%cr)") or "").strip()
+        if head:
+            parts.append(f"Last commit: {head}")
+        return "\n".join(parts)
 
 
 class PathError(ValueError):
@@ -568,18 +637,22 @@ def _count(res: AgentResult, usage: dict) -> None:
     res.model = usage.get("model") or res.model
 
 
-def _replay(entries: list[dict], model: str) -> tuple[list[dict], AgentResult, float, list[dict], set[str]]:
+def _replay(entries: list[dict], model: str):
     """Rebuild a run from its journal: the messages so far, the counters
     (steps and spend count against the resumed run's limits), the elapsed
-    time, the last reply's tool calls, and the calls that started without
-    finishing."""
+    time, the last reply's tool calls, the calls that started without
+    finishing, the processes those started, and when the journal was last
+    written."""
     messages: list[dict] = []
     res = AgentResult(status="ok", model=model)
     elapsed = 0.0
     tail: list[dict] = []
     started: set[str] = set()
+    spawns: dict[str, dict] = {}
+    last_ts = None
     for entry in entries:
         kind, data = entry["kind"], entry["data"]
+        last_ts = entry.get("ts", last_ts)
         if kind == "start":
             messages = list(data["messages"])
         elif kind == "model":
@@ -592,27 +665,113 @@ def _replay(entries: list[dict], model: str) -> tuple[list[dict], AgentResult, f
             tail, started = [], set()
         elif kind == "call":
             started.add(data["key"])
+        elif kind == "spawn":
+            spawns[data["key"]] = data
         elif kind == "result":
             started.discard(data["key"])
+            spawns.pop(data["key"], None)
             messages.append({"role": "tool", "tool_call_id": data["key"], "content": data["content"]})
-    return messages, res, elapsed, tail, started
+    spawns = {k: v for k, v in spawns.items() if k in started}
+    return messages, res, elapsed, tail, started, spawns, last_ts
+
+
+def _tool_of(calls: list[dict], key: str) -> tuple[str, dict]:
+    """(name, args) of the call with `key` in a model reply."""
+    for i, call in enumerate(calls):
+        if _call_key(call, i) == key:
+            fn = call.get("function") or {}
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            return fn.get("name", ""), args if isinstance(args, dict) else {}
+    return "", {}
 
 
 def _replay_safe(calls: list[dict], key: str) -> bool:
-    for i, call in enumerate(calls):
-        if _call_key(call, i) == key:
-            return (call.get("function") or {}).get("name") in REPLAY_SAFE_TOOLS
-    return False
+    return _tool_of(calls, key)[0] in REPLAY_SAFE_TOOLS
 
 
-def _interruption_report(name: str) -> str:
+def _interruption_report(name: str, evidence: str = "") -> str:
     report = (f"INTERRUPTED: the process running you stopped while this `{name}` call was in progress, so it "
               "may have completed, partly completed, or not run at all. It was not re-run because it is not "
               "safe to replay. Investigate before continuing: check the state this call would have changed "
               "(git status, git diff, the files involved), then redo it only if it is still needed.")
-    if name == "run":
-        report += " Anything the command started in the background may or may not still be running."
-    return report
+    return f"{report}\n{evidence}" if evidence else report
+
+
+def _run_evidence(spawn: dict) -> str:
+    """Stop a cut-off command that outlived its agent, and show its last output."""
+    pgid, path = spawn.get("pgid"), spawn.get("output")
+    if pgid and spawn.get("boot") == _boot_id() and _group_alive(pgid):
+        _kill_group(pgid)
+        lines = ["The command was still running when you resumed; it has been stopped."]
+    else:
+        lines = ["The command is no longer running; its exit status is unknown."]
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - EVIDENCE_OUTPUT_CHARS))
+            out = f.read().decode(errors="replace")
+    except (OSError, TypeError):
+        lines.append("Its output was not kept.")
+    else:
+        lines.append(f"Its last output:\n{out}" if out.strip() else "It had printed nothing.")
+        _unlink(path)
+    return "\n".join(lines)
+
+
+def _group_alive(pgid: int) -> bool:
+    """Any live (non-zombie) process in the group? Falls back to a signal
+    probe, which also counts zombies, where /proc isn't available."""
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except OSError:
+            return False
+    for pid in pids:
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            continue
+        fields = stat[stat.rfind(")") + 2:].split()  # state, ppid, pgrp, ...
+        if len(fields) > 2 and fields[2] == str(pgid) and fields[0] != "Z":
+            return True
+    return False
+
+
+def _boot_id() -> str:
+    """Distinguishes boots, so a pid recorded before a reboot is never signalled."""
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return ""
+
+
+def _unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _git(root: str, *args: str) -> str | None:
+    try:
+        r = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _ago(seconds: float) -> str:
+    if seconds < 90:
+        return f"{max(1, round(seconds))}s"
+    if seconds < 5400:
+        return f"{round(seconds / 60)} min"
+    return f"{seconds / 3600:.1f} h"
 
 
 def _trim_history(messages: list[dict]) -> None:

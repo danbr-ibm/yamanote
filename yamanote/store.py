@@ -371,8 +371,8 @@ class Store:
                    (journal_id, run_id, time.time(), kind, json.dumps(data)))
 
     def journal(self, journal_id: int) -> list[dict]:
-        rows = self._all("SELECT kind, data FROM journal WHERE journal_id=? ORDER BY id", (journal_id,))
-        return [{"kind": r["kind"], "data": json.loads(r["data"])} for r in rows]
+        rows = self._all("SELECT ts, kind, data FROM journal WHERE journal_id=? ORDER BY id", (journal_id,))
+        return [{"ts": r["ts"], "kind": r["kind"], "data": json.loads(r["data"])} for r in rows]
 
     def resumable_run(self, item_id: int, station: str, role: str, max_resumes: int) -> dict | None:
         """The item's latest `role` run at `station`, if a dead process left it

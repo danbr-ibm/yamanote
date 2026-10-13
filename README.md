@@ -571,7 +571,11 @@ file's path and first 6,000 characters, not whole files. Playbooks are per proje
   crash) the train's agent resumes where it stopped instead of starting over. A tool
   call that was cut off is re-run only if it is safe to replay (`list_dir`,
   `read_file`, `grep`, `write_file`); for `edit_file` and `run` the agent instead gets
-  an interruption report and investigates what actually happened. A run is resumed at
+  an interruption report and investigates what actually happened. The factory gathers
+  the evidence first, without the model: how long the run was down, `git status`, the
+  uncommitted diff summary and last commit; for a cut-off command whether it was still
+  running (it is stopped) and the tail of its output; for a cut-off edit whether it
+  landed. A command that never actually started is just run. A run is resumed at
   most `AGENT_TEAM_AGENT_MAX_RESUMES` times (default 2; 0 turns this off), keeps its
   step, time and spend limits, and shows up as a "resumed" event on the train.
 - **Retention:** after 14 days, step-level detail and events of finished trains are
