@@ -25,7 +25,7 @@ import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
 
 from . import cron, decisions, gitops, notify, prompts, settings
-from .agent import READ_TOOLS, RUN_TOOLS, WRITE_TOOLS, Agent, AgentResult, single_shot
+from .agent import READ_TOOLS, RUN_TOOLS, WRITE_TOOLS, Agent, AgentResult, reap, single_shot, sweep_run_outputs
 from .checks import CheckResult, run_check
 from .fleet import Fleet
 from .llm import UNREACHABLE, Client
@@ -46,6 +46,14 @@ class StoreRecorder:
 
     def step(self, kind, name, detail, *, tokens_in=0, tokens_out=0, cost_usd=0.0, model="", cached_tokens=0):
         self.store.add_step(self.run_id, kind, name, detail, tokens_in, tokens_out, cost_usd, model, cached_tokens)
+
+
+class StoreJournal:
+    def __init__(self, store: Store, journal_id: int, run_id: int):
+        self.store, self.journal_id, self.run_id = store, journal_id, run_id
+
+    def append(self, kind, data):
+        self.store.journal_append(self.journal_id, self.run_id, kind, data)
 
 
 class ItemGone(Exception):
@@ -94,6 +102,14 @@ class Factory:
     # ─── lifecycle ──────────────────────────────────────────────────────
 
     def _recover(self):
+        # Runs still 'running' belonged to a process that died: stop whatever
+        # their commands left running before anything else touches the worktrees.
+        for run in self.store.active_runs():
+            if run.get("journal_id"):
+                pgids = reap(self.store.journal(run["journal_id"]))
+                if pgids:
+                    self.store.journal_append(run["journal_id"], run["id"], "reaped", {"pgids": pgids})
+                    log.info("Stopped %d leftover command(s) of run %d", len(pgids), run["id"])
         n = self.store.interrupt_running()
         for item in self.store.items(("running",)):
             # Anything a verifier or inspector left in the worktree is junk; only
@@ -470,23 +486,36 @@ class Factory:
         self._check_budget(item)
         model, cls = self.model_for(station, item)
         item_id = item["id"] if item else None
-        run_id = self.store.start_run(item_id, role, station, model, cls)
+        prior = item and self.store.resumable_run(item_id, station, role, settings.AGENT_MAX_RESUMES)
+        run_id = self.store.start_run(item_id, role, station, model, cls,
+                                      journal_id=prior["journal_id"] if prior else None)
+        journal_id = prior["journal_id"] if prior else run_id
+        if not prior:
+            self.store.set_run_journal(run_id, journal_id)
         budget = settings.RUN_BUDGET_USD
         if item:
             spent = (self.store.get_item(item_id) or item).get("cost_usd") or 0
             budget = min(budget, settings.ITEM_BUDGET_USD - spent)
         agent = Agent(role=role, model=model, system=system.format(root=root, branch=(item or {}).get("branch", "")),
                       root=root, tools=tools, result_schema=schema, recorder=StoreRecorder(self.store, run_id),
-                      client=self.client, fallbacks=[settings.FALLBACK_MODEL], budget_usd=budget)
+                      client=self.client, fallbacks=[settings.FALLBACK_MODEL], budget_usd=budget,
+                      journal=StoreJournal(self.store, journal_id, run_id))
         agent_key = key or (f"item:{item_id}" if item_id else role)
         self.agents[agent_key] = agent
         METRICS.agent_launches_total.inc({"agent": role})
         try:
-            res = agent.run(task)
+            if prior:
+                self.store.event(item_id, station, "resumed", f"{role.capitalize()} picks up interrupted run "
+                                 f"#{prior['id']} from its journal", {"run_id": run_id, "from_run": prior["id"]})
+                res = agent.resume(self.store.journal(journal_id), _resume_note(station))
+            else:
+                res = agent.run(task)
         except Exception as e:
             res = AgentResult(status="error", error=f"{type(e).__name__}: {e}")
         finally:
             self.agents.pop(agent_key, None)
+        if res.status == "cancelled" and not self._stopping:
+            agent.abandon()  # cancelled or reaped by the SLA: nothing will resume it
         self.store.finish_run(run_id, "interrupted" if self._stopping else res.status, res.summary, res.error)
         if self._stopping:
             raise ItemGone()  # leave the item 'running'; startup recovery re-queues it
@@ -1091,6 +1120,7 @@ class Factory:
                 if os.path.isdir(project):
                     for path in gitops.gc_worktrees(project, keep):
                         self.store.event(None, None, "gc", f"Removed orphaned worktree {path}")
+            sweep_run_outputs(86400)
         if now - (self.store.kv_get("last_prune", 0) or 0) > 86400:
             self.store.kv_set("last_prune", now)
             self._prune(now)
@@ -1799,6 +1829,15 @@ def _ops_settings() -> str:
 def _signature(line: str) -> str:
     """Error identity with numbers (ids, timestamps, ports) masked."""
     return re.sub(r"\d+", "N", line)[:120]
+
+
+def _resume_note(station: str) -> str:
+    """What an agent resumed after a restart should know beyond its own calls."""
+    note = ("The factory process restarted while you were working; your run was resumed from its journal. "
+            "Processes you started with `run`, including background ones, did not survive the restart.")
+    if station != "build":
+        note += " Uncommitted changes in the worktree were discarded on restart, so files you wrote may be gone."
+    return note + " Check the state you depend on before continuing."
 
 
 def validate_project(path: str) -> str | None:

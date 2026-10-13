@@ -1,13 +1,18 @@
 """Agent loop and tool sandbox tests (offline)."""
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
-from tests.helpers import FakeClient, finish, reply, tool_call
-from yamanote.agent import READ_TOOLS, RUN_TOOLS, WRITE_TOOLS, Agent, _extract_json, _trim_history
+from tests.helpers import FakeClient, finish, reply, sh, tool_call
+from yamanote.agent import (READ_TOOLS, RUN_TOOLS, RUN_TAG_ENV, WRITE_TOOLS, Agent, _extract_json, _kill_group,
+                            _trim_history, reap, sweep_run_outputs)
 from yamanote.llm import _parse, _with_cache_breakpoints
 
 SYSTEM = "ROLE: Builder. test agent"
@@ -167,6 +172,230 @@ class LoopTest(unittest.TestCase):
     def test_missing_result_is_an_error(self):
         res, _ = self.run_agent(finish("no result"), schema={"type": "object"})
         self.assertEqual(res.status, "error")
+
+
+class ListJournal:
+    def __init__(self, entries=None):
+        self.entries = list(entries or [])
+
+    def append(self, kind, data):
+        self.entries.append({"kind": kind, "data": json.loads(json.dumps(data))})
+
+    def kinds(self):
+        return [e["kind"] for e in self.entries]
+
+
+class DurableLoopTest(unittest.TestCase):
+    """A journaled run, cut off at some point, continues in a fresh Agent."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.seen = []  # messages the model was shown, per call
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def agent(self, *turns, journal=None, **kw):
+        seq = list(turns)
+
+        def builder(messages, turn):
+            self.seen.append(list(messages))
+            return seq[turn] if turn < len(seq) else finish("done")
+        return Agent(role="build", model="m", system=SYSTEM, root=str(self.root),
+                     tools=READ_TOOLS + WRITE_TOOLS + RUN_TOOLS, recorder=Recorder(),
+                     client=FakeClient({"builder": builder}), journal=journal or ListJournal(), **kw)
+
+    def interrupted_after_call(self, call, spawn=None):
+        """The journal of a run whose process died while `call` was executing."""
+        j = ListJournal()
+        j.append("start", {"messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": "task"}]})
+        msg = reply(call).message
+        j.append("model", {"message": msg, "usage": {"tokens_in": 100, "cost_usd": 0.25}, "elapsed": 5.0})
+        j.append("call", {"key": call["id"], "name": call["function"]["name"],
+                          "args": json.loads(call["function"]["arguments"])})
+        if spawn:
+            j.append("spawn", {"key": call["id"], **spawn})
+        return j
+
+    def spawn(self, command):
+        """Start `command` the way the run tool does; return its spawn entry."""
+        fd, out = tempfile.mkstemp(prefix="yamanote-test-", suffix=".log")
+        tag = os.urandom(8).hex()
+        proc = subprocess.Popen(["bash", "-c", command], cwd=self.root, stdout=fd, stderr=subprocess.STDOUT,
+                                start_new_session=True, env={**os.environ, RUN_TAG_ENV: tag})
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(out) and os.unlink(out))
+        self.addCleanup(proc.wait)
+        self.addCleanup(lambda: _kill_group(proc.pid))
+        self.proc = proc
+        return {"pgid": proc.pid, "output": out, "tag": tag}
+
+    def test_every_turn_is_journaled_and_each_call_before_it_runs(self):
+        j = ListJournal()
+        a = self.agent(reply(tool_call("write_file", {"path": "f.txt", "content": "hi"})), finish("ok"), journal=j)
+        dispatch = a._dispatch
+        a._dispatch = lambda name, args: (self.assertEqual(j.kinds()[-1], "call"), dispatch(name, args))[1]
+        self.assertTrue(a.run("task").ok)
+        self.assertEqual(j.kinds(), ["start", "model", "call", "result", "model", "result", "end"])
+        self.assertEqual(j.entries[2]["data"], {"key": "call_write_file_0", "name": "write_file",
+                                               "args": {"path": "f.txt", "content": "hi"}})
+
+    def test_unsafe_interrupted_call_is_reported_not_rerun(self):
+        call = tool_call("run", {"command": "echo x >> ran.txt"})
+        j = self.interrupted_after_call(call, {"pgid": 0, "output": None, "tag": ""})
+        res = self.agent(None, finish("checked"), journal=j).resume(j.entries)
+        self.assertTrue(res.ok)
+        self.assertFalse((self.root / "ran.txt").exists(), "run is not replay-safe")
+        report = self.seen[-1][-1]
+        self.assertEqual((report["role"], report["tool_call_id"]), ("tool", call["id"]))
+        self.assertIn("INTERRUPTED", report["content"])
+        self.assertIn("Investigate", report["content"])
+        self.assertEqual(j.entries[4]["data"], {"interrupted": [call["id"]], "replayed": []})
+
+    def test_safe_interrupted_call_is_replayed(self):
+        (self.root / "a.txt").write_text("hello\n")
+        j = self.interrupted_after_call(tool_call("read_file", {"path": "a.txt"}))
+        a = self.agent(None, finish("read it"), journal=j)
+        self.assertTrue(a.resume(j.entries).ok)
+        self.assertIn("hello", self.seen[-1][-1]["content"])
+        self.assertEqual(a.resumed, {"interrupted": 0, "replayed": 1})
+
+    def test_calls_that_never_started_run_normally(self):
+        first, second = (tool_call("write_file", {"path": "a.txt", "content": "1"}, 0),
+                         tool_call("run", {"command": "echo ran > b.txt"}, 1))
+        j = ListJournal()
+        j.append("start", {"messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": "task"}]})
+        j.append("model", {"message": reply(first, second).message, "usage": {}, "elapsed": 1.0})
+        j.append("call", {"key": first["id"], "name": "write_file", "args": {"path": "a.txt", "content": "1"}})
+        j.append("result", {"key": first["id"], "content": "Wrote a.txt"})
+        self.assertTrue(self.agent(None, finish("ok"), journal=j).resume(j.entries).ok)
+        self.assertFalse((self.root / "a.txt").exists(), "a call with a result is not run again")
+        self.assertEqual((self.root / "b.txt").read_text(), "ran\n")
+        self.assertEqual([m.get("tool_call_id") for m in self.seen[-1][-2:]], [first["id"], second["id"]])
+
+    def test_a_journaled_finish_completes_without_another_model_call(self):
+        j = ListJournal()
+        self.agent(finish("all done", {"verdict": "APPROVED"}), journal=j, result_schema={"type": "object"}).run("t")
+        open_run = [e for e in j.entries if e["kind"] != "end"]  # died before the factory saw the result
+        self.seen.clear()
+        res = self.agent(journal=ListJournal(open_run), result_schema={"type": "object"}).resume(open_run)
+        self.assertEqual((res.status, res.result), ("ok", {"verdict": "APPROVED"}))
+        self.assertEqual(self.seen, [])
+
+    def test_resumed_run_keeps_counting_against_its_limits(self):
+        j = self.interrupted_after_call(tool_call("list_dir", {}))
+        res = self.agent(None, reply(tool_call("list_dir", {})), journal=j, max_steps=2).resume(j.entries)
+        self.assertEqual(res.status, "max_steps")
+        self.assertAlmostEqual(res.cost_usd, 0.251)
+
+    def test_resume_note_is_shown_to_the_agent(self):
+        j = self.interrupted_after_call(tool_call("list_dir", {}))
+        self.agent(None, finish("ok"), journal=j).resume(j.entries, note="worktree was reset")
+        self.assertEqual(self.seen[-1][-1], {"role": "user", "content": "worktree was reset"})
+
+    def test_cancelled_run_leaves_the_journal_open_and_the_call_unanswered(self):
+        j = ListJournal()
+        a = self.agent(reply(tool_call("run", {"command": "sleep 30"})), journal=j)
+        threading.Timer(0.5, a.stop).start()
+        self.assertEqual(a.run("task").status, "cancelled")
+        self.assertEqual(j.kinds(), ["start", "model", "call", "spawn"])
+        self.assertTrue(os.path.exists(j.entries[3]["data"]["output"]), "output kept for the resume")
+        a.abandon()
+
+    def test_run_that_never_spawned_a_process_runs_normally(self):
+        j = self.interrupted_after_call(tool_call("run", {"command": "echo x >> ran.txt"}))
+        a = self.agent(None, finish("ok"), journal=j)
+        self.assertTrue(a.resume(j.entries).ok)
+        self.assertEqual((self.root / "ran.txt").read_text(), "x\n")
+        self.assertEqual(a.resumed, {"interrupted": 0, "replayed": 0})
+
+    def test_command_still_running_is_stopped_and_its_last_output_shown(self):
+        spawn = self.spawn("echo early-line; echo partial-output; sleep 30")
+        time.sleep(0.3)
+        j = self.interrupted_after_call(tool_call("run", {"command": "make test"}), spawn)
+        self.agent(None, finish("ok"), journal=j).resume(j.entries)
+        report = self.seen[-1][-1]["content"] if self.seen[-1][-1]["role"] == "tool" else self.seen[-1][-2]["content"]
+        self.assertIn("still running when you resumed; it has been stopped", report)
+        self.assertIn("partial-output", report)
+        self.assertIsNotNone(self.proc.wait(timeout=2), "the leftover command was killed")
+        self.assertFalse(os.path.exists(spawn["output"]), "output file removed once read")
+
+    def test_reap_stops_only_processes_carrying_the_run_tag(self):
+        spawn = self.spawn("sleep 30 & sleep 30")
+        time.sleep(0.3)
+        other = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        impostor = {"pgid": other.pid, "output": None, "tag": spawn["tag"]}  # e.g. a reused pid
+        stopped = reap([{"kind": "spawn", "data": spawn}, {"kind": "spawn", "data": impostor}])
+        self.assertEqual(stopped, [spawn["pgid"]])
+        self.assertIsNotNone(self.proc.wait(timeout=2))
+        self.assertIsNone(other.poll(), "an untagged process is never signalled")
+
+    def test_reaped_command_is_reported_as_stopped_at_restart(self):
+        j = self.interrupted_after_call(tool_call("run", {"command": "make"}),
+                                        {"pgid": 4242, "output": None, "tag": "x"})
+        j.append("reaped", {"pgids": [4242]})
+        a = self.agent(None, finish("ok"), journal=j)
+        a.resume(j.entries)
+        self.assertIn("still running when the factory restarted", next(iter(a._evidence.values())))
+
+    def test_abandon_closes_the_journal_and_removes_kept_output(self):
+        j = ListJournal()
+        a = self.agent(reply(tool_call("run", {"command": "sleep 30"})), journal=j)
+        threading.Timer(0.5, a.stop).start()
+        a.run("task")
+        out = j.entries[3]["data"]["output"]
+        self.assertTrue(os.path.exists(out))
+        a.abandon()
+        self.assertFalse(os.path.exists(out))
+        self.assertEqual(j.kinds()[-1], "end")
+
+    def test_sweep_removes_only_old_run_outputs(self):
+        old = tempfile.NamedTemporaryFile(prefix="yamanote-run-", suffix=".log", delete=False).name
+        new = tempfile.NamedTemporaryFile(prefix="yamanote-run-", suffix=".log", delete=False).name
+        self.addCleanup(lambda: [os.path.exists(f) and os.unlink(f) for f in (old, new)])
+        os.utime(old, (time.time() - 7200, time.time() - 7200))
+        self.assertGreaterEqual(sweep_run_outputs(3600), 1)
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.exists(new))
+
+    def test_finished_command_output_is_tailed(self):
+        spawn = self.spawn("seq 1 5000")
+        time.sleep(0.5)
+        j = self.interrupted_after_call(tool_call("run", {"command": "seq 1 5000"}), spawn)
+        a = self.agent(None, finish("ok"), journal=j)
+        a.resume(j.entries)
+        report = a._evidence[j.entries[1]["data"]["message"]["tool_calls"][0]["id"]]
+        self.assertIn("no longer running", report)
+        self.assertIn("\n5000\n", report)
+        self.assertNotIn("\n1\n", report, "only the tail of the output")
+        self.assertLess(len(report), 1700)
+
+    def test_interrupted_edit_reports_whether_it_landed(self):
+        (self.root / "a.py").write_text("x = 2\n")
+        j = self.interrupted_after_call(tool_call("edit_file", {"path": "a.py", "old_string": "x = 1",
+                                                                "new_string": "x = 2"}))
+        self.agent(None, finish("ok"), journal=j).resume(j.entries)
+        report = self.seen[-1][-1]["content"]
+        self.assertIn("old_string 0 time(s) and new_string 1 time(s): the edit looks applied", report)
+
+    def test_resume_note_carries_downtime_and_worktree_snapshot(self):
+        sh("git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m first",
+           self.root)
+        (self.root / "new.py").write_text("x\n")
+        j = self.interrupted_after_call(tool_call("list_dir", {}))
+        for e in j.entries:
+            e["ts"] = time.time() - 600
+        j.append("reaped", {"pgids": []})  # the restart's own entry doesn't count as the run's last word
+        j.entries[-1]["ts"] = time.time()
+        self.agent(None, finish("ok"), journal=j).resume(j.entries, note="restarted")
+        note = self.seen[-1][-1]["content"]
+        self.assertTrue(note.startswith("restarted\n\nYou were stopped 10 min ago."), note)
+        self.assertIn("?? new.py", note)
+        self.assertIn("Last commit:", note)
+        self.assertIn("first", note)
 
 
 class HelperTest(unittest.TestCase):

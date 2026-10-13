@@ -566,6 +566,18 @@ file's path and first 6,000 characters, not whole files. Playbooks are per proje
 - **Restarts:** interrupted runs are marked, their trains re-queued at the same station
   (an interrupted build attempt isn't counted), and anything a verifier left in a
   worktree is discarded. Shutdown waits at most 10s for in-flight model calls.
+- **Durable agent runs:** every agent's conversation, model reply and tool call is
+  journaled to the database before it is acted on, so after a restart (clean or a
+  crash) the train's agent resumes where it stopped instead of starting over. A tool
+  call that was cut off is re-run only if it is safe to replay (`list_dir`,
+  `read_file`, `grep`, `write_file`); for `edit_file` and `run` the agent instead gets
+  an interruption report and investigates what actually happened. The factory gathers
+  the evidence first, without the model: how long the run was down, `git status`, the
+  uncommitted diff summary and last commit; for a cut-off command whether it was still
+  running (it is stopped) and the tail of its output; for a cut-off edit whether it
+  landed. A command that never actually started is just run. A run is resumed at
+  most `AGENT_TEAM_AGENT_MAX_RESUMES` times (default 2; 0 turns this off), keeps its
+  step, time and spend limits, and shows up as a "resumed" event on the train.
 - **Retention:** after 14 days, step-level detail and events of finished trains are
   pruned (items, run summaries and retros stay) and old failed branches are deleted.
 - **Dashboard:** binds to 127.0.0.1 by default. To expose it on your network set
