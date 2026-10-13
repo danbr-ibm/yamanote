@@ -388,6 +388,8 @@ class DurableLoopTest(unittest.TestCase):
         j = self.interrupted_after_call(tool_call("list_dir", {}))
         for e in j.entries:
             e["ts"] = time.time() - 600
+        j.append("reaped", {"pgids": []})  # the restart's own entry doesn't count as the run's last word
+        j.entries[-1]["ts"] = time.time()
         self.agent(None, finish("ok"), journal=j).resume(j.entries, note="restarted")
         note = self.seen[-1][-1]["content"]
         self.assertTrue(note.startswith("restarted\n\nYou were stopped 10 min ago."), note)

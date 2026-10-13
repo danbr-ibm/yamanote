@@ -671,7 +671,8 @@ def _replay(entries: list[dict], model: str):
     last_ts = None
     for entry in entries:
         kind, data = entry["kind"], entry["data"]
-        last_ts = entry.get("ts", last_ts)
+        if kind != "reaped":  # written by the restarted factory, not the run: not when it stopped
+            last_ts = entry.get("ts", last_ts)
         if kind == "start":
             messages = list(data["messages"])
         elif kind == "model":
