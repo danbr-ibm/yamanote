@@ -47,6 +47,10 @@ CONTEXT_SOFT_LIMIT = 320_000  # characters of history before old tool output is 
 KEEP_RECENT_TOOL_RESULTS = 8
 EVIDENCE_OUTPUT_CHARS = 1500  # tail of a cut-off command's output shown on resume
 SNAPSHOT_STATUS_LINES = 20    # git status lines shown on resume
+# Set on every `run` command (inherited by what it starts) so processes left
+# behind by a dead factory are recognised by more than a pid that may be reused.
+RUN_TAG_ENV = "YAMANOTE_RUN_TAG"
+RUN_OUTPUT_PREFIX = "yamanote-run-"
 _SECRET_ENV = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.I)
 
 
@@ -65,9 +69,10 @@ class Journal(Protocol):
     loop acts on them; `resume` rebuilds the run from them in order.
 
     kinds: start {messages} · model {message, usage, elapsed} · message {message}
-    · call {key, name, args} (before the tool runs) · spawn {key, pgid, output, boot}
-    (a `run` command's process and output file) · result {key, content}
-    · resume {interrupted, replayed} · end {status}"""
+    · call {key, name, args} (before the tool runs) · spawn {key, pgid, output, tag}
+    (a `run` command's process group, output file and RUN_TAG_ENV value)
+    · result {key, content} · reaped {pgids} (left running by a dead process,
+    stopped at startup) · resume {interrupted, replayed} · end {status}"""
     def append(self, kind: str, data: dict) -> None: ...
 
 
@@ -165,6 +170,7 @@ class Agent:
         self.resumed: dict | None = None  # set by resume(): interrupted/replayed call counts
         self._evidence: dict[str, str] = {}  # interrupted call key -> what resume found out about it
         self._calling: str | None = None  # key of the tool call being dispatched
+        self._kept_outputs: list[str] = []  # output files of cancelled commands, kept for a resume
 
     # -- loop --
 
@@ -180,7 +186,7 @@ class Agent:
         started but has no result is replayed if REPLAY_SAFE_TOOLS allows it,
         and otherwise answered with an interruption report. `note` tells the
         agent what else changed while it was down."""
-        messages, res, elapsed, tail, started, spawns, last_ts = _replay(entries, self.model)
+        messages, res, elapsed, tail, started, spawns, last_ts, reaped = _replay(entries, self.model)
         if not messages:
             res.status, res.error = "error", "journal has no start entry"
             return res
@@ -189,7 +195,7 @@ class Agent:
         interrupted = [k for k in started if not _replay_safe(tail, k)]
         replayed = [k for k in started if k not in interrupted]
         # Gather evidence before anything runs (this also stops a command still running).
-        self._evidence = {k: self._call_evidence(*_tool_of(tail, k), spawns.get(k)) for k in interrupted}
+        self._evidence = {k: self._call_evidence(*_tool_of(tail, k), spawns.get(k), reaped) for k in interrupted}
         note = "\n\n".join(part for part in (note, self._workspace_snapshot(last_ts)) if part)
         self.journal.append("resume", {"interrupted": interrupted, "replayed": replayed})
         self.resumed = {"interrupted": len(interrupted), "replayed": len(replayed)}
@@ -206,6 +212,14 @@ class Agent:
         if res.status != "cancelled":
             self.journal.append("end", {"status": res.status})
         return res
+
+    def abandon(self) -> None:
+        """A cancelled run that will not be resumed: close its journal and
+        remove the output files kept for a resume."""
+        for path in self._kept_outputs:
+            _unlink(path)
+        self._kept_outputs.clear()
+        self.journal.append("end", {"status": "cancelled"})
 
     def _say(self, messages: list[dict], content: str) -> None:
         msg = {"role": "user", "content": content}
@@ -484,7 +498,9 @@ class Agent:
         env = {k: v for k, v in os.environ.items() if not _SECRET_ENV.search(k) and k != "CLAUDECODE"}
         env["GIT_TERMINAL_PROMPT"] = "0"
         # Named, so a resumed run can show what a cut-off command printed.
-        fd, out_path = tempfile.mkstemp(prefix="yamanote-run-", suffix=".log")
+        tag = os.urandom(8).hex()
+        env[RUN_TAG_ENV] = tag
+        fd, out_path = tempfile.mkstemp(prefix=RUN_OUTPUT_PREFIX, suffix=".log")
         with os.fdopen(fd, "w+", errors="replace") as out_file:
             proc = subprocess.Popen(["bash", "-c", command], cwd=self.root, env=env, text=True,
                                     stdout=out_file, stderr=subprocess.STDOUT,
@@ -492,7 +508,7 @@ class Agent:
             self._pgids.add(proc.pid)  # new session: pgid == pid
             if self._calling:
                 self.journal.append("spawn", {"key": self._calling, "pgid": proc.pid, "output": out_path,
-                                              "boot": _boot_id()})
+                                              "tag": tag})
             deadline = time.monotonic() + limit
             rc: int | str
             while True:
@@ -512,17 +528,19 @@ class Agent:
                         break
             out_file.seek(0)
             out = out_file.read(MAX_TOOL_OUTPUT * 4)
-        if not self.cancel.is_set():  # a cancelled call stays open in the journal; resume reads and removes the file
+        if self.cancel.is_set():  # the call stays open in the journal; resume (or abandon) removes the file
+            self._kept_outputs.append(out_path)
+        else:
             _unlink(out_path)
         return f"[exit {rc}]\n{_truncate(out)}"
 
     # -- resume evidence --
 
-    def _call_evidence(self, name: str, args: dict, spawn: dict | None) -> str:
+    def _call_evidence(self, name: str, args: dict, spawn: dict | None, reaped: set[int]) -> str:
         """Facts about an interrupted call, gathered without the model."""
         try:
             if name == "run" and spawn:
-                return _run_evidence(spawn)
+                return _run_evidence(spawn, reaped)
             if name == "edit_file":
                 return self._edit_evidence(args)
         except (OSError, PathError, TypeError, ValueError) as e:
@@ -649,6 +667,7 @@ def _replay(entries: list[dict], model: str):
     tail: list[dict] = []
     started: set[str] = set()
     spawns: dict[str, dict] = {}
+    reaped: set[int] = set()
     last_ts = None
     for entry in entries:
         kind, data = entry["kind"], entry["data"]
@@ -667,12 +686,14 @@ def _replay(entries: list[dict], model: str):
             started.add(data["key"])
         elif kind == "spawn":
             spawns[data["key"]] = data
+        elif kind == "reaped":
+            reaped.update(data.get("pgids", []))
         elif kind == "result":
             started.discard(data["key"])
             spawns.pop(data["key"], None)
             messages.append({"role": "tool", "tool_call_id": data["key"], "content": data["content"]})
     spawns = {k: v for k, v in spawns.items() if k in started}
-    return messages, res, elapsed, tail, started, spawns, last_ts
+    return messages, res, elapsed, tail, started, spawns, last_ts, reaped
 
 
 def _tool_of(calls: list[dict], key: str) -> tuple[str, dict]:
@@ -700,11 +721,12 @@ def _interruption_report(name: str, evidence: str = "") -> str:
     return f"{report}\n{evidence}" if evidence else report
 
 
-def _run_evidence(spawn: dict) -> str:
+def _run_evidence(spawn: dict, reaped: set[int]) -> str:
     """Stop a cut-off command that outlived its agent, and show its last output."""
-    pgid, path = spawn.get("pgid"), spawn.get("output")
-    if pgid and spawn.get("boot") == _boot_id() and _group_alive(pgid):
-        _kill_group(pgid)
+    path = spawn.get("output")
+    if spawn.get("pgid") in reaped:
+        lines = ["The command was still running when the factory restarted; it has been stopped."]
+    elif _stop_pids(_tagged_pids(spawn)):
         lines = ["The command was still running when you resumed; it has been stopped."]
     else:
         lines = ["The command is no longer running; its exit status is unknown."]
@@ -721,34 +743,80 @@ def _run_evidence(spawn: dict) -> str:
     return "\n".join(lines)
 
 
-def _group_alive(pgid: int) -> bool:
-    """Any live (non-zombie) process in the group? Falls back to a signal
-    probe, which also counts zombies, where /proc isn't available."""
-    try:
-        pids = [d for d in os.listdir("/proc") if d.isdigit()]
-    except OSError:
+def reap(entries: list[dict]) -> list[int]:
+    """Stop every process a dead run's `run` commands left behind (dev
+    servers included). Returns the process groups that had any."""
+    stopped = []
+    for entry in entries:
+        if entry["kind"] == "spawn" and _stop_pids(_tagged_pids(entry["data"])):
+            stopped.append(entry["data"]["pgid"])
+    return stopped
+
+
+def sweep_run_outputs(max_age: float) -> int:
+    """Remove `run` output files older than max_age seconds (kept for a resume that never came)."""
+    removed, cutoff = 0, time.time() - max_age
+    for path in Path(tempfile.gettempdir()).glob(f"{RUN_OUTPUT_PREFIX}*.log"):
         try:
-            os.killpg(pgid, 0)
-            return True
-        except OSError:
-            return False
-    for pid in pids:
-        try:
-            stat = Path(f"/proc/{pid}/stat").read_text()
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
         except OSError:
             continue
-        fields = stat[stat.rfind(")") + 2:].split()  # state, ppid, pgrp, ...
-        if len(fields) > 2 and fields[2] == str(pgid) and fields[0] != "Z":
-            return True
-    return False
+    return removed
 
 
-def _boot_id() -> str:
-    """Distinguishes boots, so a pid recorded before a reboot is never signalled."""
+def _tagged_pids(spawn: dict) -> list[int]:
+    """Live processes in the spawn's group that carry its tag: a reused pid,
+    or a process from another run, is never matched."""
+    pgid, tag = spawn.get("pgid"), spawn.get("tag")
+    if not pgid or not tag:
+        return []
+    marker = f"{RUN_TAG_ENV}={tag}".encode()
+    pids = []
     try:
-        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        candidates = [d for d in os.listdir("/proc") if d.isdigit()]
     except OSError:
-        return ""
+        return []
+    for pid in candidates:
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            fields = stat[stat.rfind(")") + 2:].split()  # state, ppid, pgrp, ...
+            if len(fields) < 3 or fields[2] != str(pgid) or fields[0] == "Z":
+                continue
+            if marker in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
+                pids.append(int(pid))
+        except OSError:
+            continue
+    return pids
+
+
+def _stop_pids(pids: list[int]) -> bool:
+    """SIGTERM, then SIGKILL whatever is left after a second. True if there was anything to stop."""
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    for _ in range(20):
+        if not any(_alive(pid) for pid in pids):
+            break
+        time.sleep(0.05)
+    for pid in pids:
+        if _alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    return bool(pids)
+
+
+def _alive(pid: int) -> bool:
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return state[state.rfind(")") + 2:][:1] != "Z"
 
 
 def _unlink(path: str) -> None:

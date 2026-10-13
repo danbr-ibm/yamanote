@@ -442,6 +442,44 @@ class RecoveryTest(FactoryTestCase):
         self.assertIn("resumed", self.kinds(item["id"]))
         self.assertEqual((self.env.project / "ran.log").read_text(), "once\n", "the command was not re-run")
 
+    def test_cancel_closes_the_journal_and_removes_kept_output(self):
+        import threading
+        started = threading.Event()
+
+        def slow_build(messages, turn):
+            started.set()
+            return reply(tool_call("run", {"command": "sleep 30"}))
+
+        f = self.make(builder=slow_build)
+        item = f.create_item("Add hello", "Create hello.py")
+        self.assertTrue(run_until(f, started.is_set))
+        run = [r for r in self.store.runs(item["id"]) if r["role"] == "builder"][-1]
+        run_until(f, lambda: "spawn" in [e["kind"] for e in self.store.journal(run["journal_id"])])
+        f.cancel(item["id"])
+        run_until(f, lambda: not f.jobs, max_ticks=100)
+        entries = self.store.journal(run["journal_id"])
+        self.assertEqual(entries[-1]["kind"], "end")
+        spawn = next(e["data"] for e in entries if e["kind"] == "spawn")
+        self.assertFalse(os.path.exists(spawn["output"]))
+
+    def test_startup_stops_commands_a_dead_factory_left_running(self):
+        import subprocess, time
+        item = self.store.create_item(title="x", project=str(self.env.project))
+        self.store.update_item(item["id"], status="running", station="build")
+        run = self.store.start_run(item["id"], "builder", "build", "m")
+        self.store.set_run_journal(run, run)
+        tag = "t" + os.urandom(4).hex()
+        proc = subprocess.Popen(["bash", "-c", "sleep 30 & wait"], start_new_session=True,
+                                env={**os.environ, "YAMANOTE_RUN_TAG": tag})
+        self.addCleanup(proc.wait)
+        time.sleep(0.2)
+        self.store.journal_append(run, run, "start", {"messages": []})
+        self.store.journal_append(run, run, "spawn", {"key": "c", "pgid": proc.pid, "output": None, "tag": tag})
+        self.make()
+        self.assertIsNotNone(proc.wait(timeout=3), "the leftover command was stopped")
+        self.assertEqual(self.store.journal(run)[-1], {"ts": self.store.journal(run)[-1]["ts"], "kind": "reaped",
+                                                       "data": {"pgids": [proc.pid]}})
+
     def test_resumable_run_needs_an_open_journal_and_resumes_left(self):
         item = self.store.create_item(title="x", project=str(self.env.project))
         run = self.store.start_run(item["id"], "builder", "build", "m", journal_id=None)

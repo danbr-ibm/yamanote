@@ -25,7 +25,7 @@ import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
 
 from . import cron, decisions, gitops, notify, prompts, settings
-from .agent import READ_TOOLS, RUN_TOOLS, WRITE_TOOLS, Agent, AgentResult, single_shot
+from .agent import READ_TOOLS, RUN_TOOLS, WRITE_TOOLS, Agent, AgentResult, reap, single_shot, sweep_run_outputs
 from .checks import CheckResult, run_check
 from .fleet import Fleet
 from .llm import UNREACHABLE, Client
@@ -102,6 +102,14 @@ class Factory:
     # ─── lifecycle ──────────────────────────────────────────────────────
 
     def _recover(self):
+        # Runs still 'running' belonged to a process that died: stop whatever
+        # their commands left running before anything else touches the worktrees.
+        for run in self.store.active_runs():
+            if run.get("journal_id"):
+                pgids = reap(self.store.journal(run["journal_id"]))
+                if pgids:
+                    self.store.journal_append(run["journal_id"], run["id"], "reaped", {"pgids": pgids})
+                    log.info("Stopped %d leftover command(s) of run %d", len(pgids), run["id"])
         n = self.store.interrupt_running()
         for item in self.store.items(("running",)):
             # Anything a verifier or inspector left in the worktree is junk; only
@@ -506,6 +514,8 @@ class Factory:
             res = AgentResult(status="error", error=f"{type(e).__name__}: {e}")
         finally:
             self.agents.pop(agent_key, None)
+        if res.status == "cancelled" and not self._stopping:
+            agent.abandon()  # cancelled or reaped by the SLA: nothing will resume it
         self.store.finish_run(run_id, "interrupted" if self._stopping else res.status, res.summary, res.error)
         if self._stopping:
             raise ItemGone()  # leave the item 'running'; startup recovery re-queues it
@@ -1110,6 +1120,7 @@ class Factory:
                 if os.path.isdir(project):
                     for path in gitops.gc_worktrees(project, keep):
                         self.store.event(None, None, "gc", f"Removed orphaned worktree {path}")
+            sweep_run_outputs(86400)
         if now - (self.store.kv_get("last_prune", 0) or 0) > 86400:
             self.store.kv_set("last_prune", now)
             self._prune(now)
@@ -1823,7 +1834,7 @@ def _signature(line: str) -> str:
 def _resume_note(station: str) -> str:
     """What an agent resumed after a restart should know beyond its own calls."""
     note = ("The factory process restarted while you were working; your run was resumed from its journal. "
-            "Background processes you started with `run` may have stopped.")
+            "Processes you started with `run`, including background ones, did not survive the restart.")
     if station != "build":
         note += " Uncommitted changes in the worktree were discarded on restart, so files you wrote may be gone."
     return note + " Check the state you depend on before continuing."

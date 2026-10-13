@@ -11,8 +11,8 @@ import unittest
 from pathlib import Path
 
 from tests.helpers import FakeClient, finish, reply, sh, tool_call
-from yamanote.agent import (READ_TOOLS, RUN_TOOLS, WRITE_TOOLS, Agent, _boot_id, _extract_json, _kill_group,
-                            _trim_history)
+from yamanote.agent import (READ_TOOLS, RUN_TOOLS, RUN_TAG_ENV, WRITE_TOOLS, Agent, _extract_json, _kill_group,
+                            _trim_history, reap, sweep_run_outputs)
 from yamanote.llm import _parse, _with_cache_breakpoints
 
 SYSTEM = "ROLE: Builder. test agent"
@@ -221,13 +221,15 @@ class DurableLoopTest(unittest.TestCase):
     def spawn(self, command):
         """Start `command` the way the run tool does; return its spawn entry."""
         fd, out = tempfile.mkstemp(prefix="yamanote-test-", suffix=".log")
+        tag = os.urandom(8).hex()
         proc = subprocess.Popen(["bash", "-c", command], cwd=self.root, stdout=fd, stderr=subprocess.STDOUT,
-                                start_new_session=True)
+                                start_new_session=True, env={**os.environ, RUN_TAG_ENV: tag})
         os.close(fd)
+        self.addCleanup(lambda: os.path.exists(out) and os.unlink(out))
         self.addCleanup(proc.wait)
         self.addCleanup(lambda: _kill_group(proc.pid))
         self.proc = proc
-        return {"pgid": proc.pid, "output": out, "boot": _boot_id()}
+        return {"pgid": proc.pid, "output": out, "tag": tag}
 
     def test_every_turn_is_journaled_and_each_call_before_it_runs(self):
         j = ListJournal()
@@ -241,7 +243,7 @@ class DurableLoopTest(unittest.TestCase):
 
     def test_unsafe_interrupted_call_is_reported_not_rerun(self):
         call = tool_call("run", {"command": "echo x >> ran.txt"})
-        j = self.interrupted_after_call(call, {"pgid": 0, "output": None, "boot": ""})
+        j = self.interrupted_after_call(call, {"pgid": 0, "output": None, "tag": ""})
         res = self.agent(None, finish("checked"), journal=j).resume(j.entries)
         self.assertTrue(res.ok)
         self.assertFalse((self.root / "ran.txt").exists(), "run is not replay-safe")
@@ -299,7 +301,7 @@ class DurableLoopTest(unittest.TestCase):
         self.assertEqual(a.run("task").status, "cancelled")
         self.assertEqual(j.kinds(), ["start", "model", "call", "spawn"])
         self.assertTrue(os.path.exists(j.entries[3]["data"]["output"]), "output kept for the resume")
-        os.unlink(j.entries[3]["data"]["output"])
+        a.abandon()
 
     def test_run_that_never_spawned_a_process_runs_normally(self):
         j = self.interrupted_after_call(tool_call("run", {"command": "echo x >> ran.txt"}))
@@ -318,6 +320,46 @@ class DurableLoopTest(unittest.TestCase):
         self.assertIn("partial-output", report)
         self.assertIsNotNone(self.proc.wait(timeout=2), "the leftover command was killed")
         self.assertFalse(os.path.exists(spawn["output"]), "output file removed once read")
+
+    def test_reap_stops_only_processes_carrying_the_run_tag(self):
+        spawn = self.spawn("sleep 30 & sleep 30")
+        time.sleep(0.3)
+        other = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        impostor = {"pgid": other.pid, "output": None, "tag": spawn["tag"]}  # e.g. a reused pid
+        stopped = reap([{"kind": "spawn", "data": spawn}, {"kind": "spawn", "data": impostor}])
+        self.assertEqual(stopped, [spawn["pgid"]])
+        self.assertIsNotNone(self.proc.wait(timeout=2))
+        self.assertIsNone(other.poll(), "an untagged process is never signalled")
+
+    def test_reaped_command_is_reported_as_stopped_at_restart(self):
+        j = self.interrupted_after_call(tool_call("run", {"command": "make"}),
+                                        {"pgid": 4242, "output": None, "tag": "x"})
+        j.append("reaped", {"pgids": [4242]})
+        a = self.agent(None, finish("ok"), journal=j)
+        a.resume(j.entries)
+        self.assertIn("still running when the factory restarted", next(iter(a._evidence.values())))
+
+    def test_abandon_closes_the_journal_and_removes_kept_output(self):
+        j = ListJournal()
+        a = self.agent(reply(tool_call("run", {"command": "sleep 30"})), journal=j)
+        threading.Timer(0.5, a.stop).start()
+        a.run("task")
+        out = j.entries[3]["data"]["output"]
+        self.assertTrue(os.path.exists(out))
+        a.abandon()
+        self.assertFalse(os.path.exists(out))
+        self.assertEqual(j.kinds()[-1], "end")
+
+    def test_sweep_removes_only_old_run_outputs(self):
+        old = tempfile.NamedTemporaryFile(prefix="yamanote-run-", suffix=".log", delete=False).name
+        new = tempfile.NamedTemporaryFile(prefix="yamanote-run-", suffix=".log", delete=False).name
+        self.addCleanup(lambda: [os.path.exists(f) and os.unlink(f) for f in (old, new)])
+        os.utime(old, (time.time() - 7200, time.time() - 7200))
+        self.assertGreaterEqual(sweep_run_outputs(3600), 1)
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.exists(new))
 
     def test_finished_command_output_is_tailed(self):
         spawn = self.spawn("seq 1 5000")
